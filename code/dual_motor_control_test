@@ -1,0 +1,158 @@
+import RPi.GPIO as GPIO
+import time, math
+
+# --- GPIO Pin Setup (BCM numbering) ---
+# You can change these to the desired Raspberry Pi GPIO pins
+MOTOR1_DIR_PIN = 20   # Direction pin for Motor 1
+MOTOR1_STEP_PIN = 21  # Step pin for Motor 1
+MOTOR2_DIR_PIN = 19   # Direction pin for Motor 2 (opposite motor)
+MOTOR2_STEP_PIN = 26  # Step pin for Motor 2
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(MOTOR1_DIR_PIN, GPIO.OUT)
+GPIO.setup(MOTOR1_STEP_PIN, GPIO.OUT)
+GPIO.setup(MOTOR2_DIR_PIN, GPIO.OUT)
+GPIO.setup(MOTOR2_STEP_PIN, GPIO.OUT)
+# (If your driver has enable pins, you can set them as well; assuming always enabled for simplicity)
+
+# --- Motor and Motion Parameters ---
+STEPS_PER_REV = 200        # motor full steps per revolution (e.g., 200 for 1.8° step motor)
+MICROSTEPPING = 16         # microstepping setting (e.g., 16 for 1/16 step, adjust if different)
+GEAR_RATIO = 3.0           # gear reduction ratio (motor rev : output rev) = 3:1
+
+STEPS_PER_REV_EFFECTIVE = STEPS_PER_REV * MICROSTEPPING  # effective steps per motor rev with microstepping
+STEPS_PER_DEGREE = STEPS_PER_REV_EFFECTIVE / 360.0       # motor steps per degree of motor shaft rotation
+
+MAX_SPEED_DEG = 90.0       # maximum speed in degrees per second (motor shaft degrees per second)
+ACCELERATION_DEG = 180.0   # acceleration in degrees per second^2 (motor shaft degrees/sec^2)
+
+# Convert speed and acceleration to steps units for internal calculations
+MAX_SPEED_STEPS = MAX_SPEED_DEG * STEPS_PER_REV_EFFECTIVE / 360.0      # max speed in steps per second
+ACCELERATION_STEPS = ACCELERATION_DEG * STEPS_PER_REV_EFFECTIVE / 360.0  # accel in steps per second^2
+
+# Internal state to keep track of current position (in degrees)
+current_angle = 0.0
+
+def move_to_angle(target_angle):
+    """Move both motors to the specified absolute angle (in degrees) with acceleration and deceleration."""
+    global current_angle
+    angle_diff = target_angle - current_angle   # difference from current position to target
+    direction = 1 if angle_diff >= 0 else -1    # +1 for positive (CW for motor1), -1 for negative (CCW for motor1)
+    steps_to_move = int(abs(angle_diff) * STEPS_PER_DEGREE)  # total steps needed (motor shaft steps)
+
+    if steps_to_move == 0:
+        # No movement needed
+        return
+
+    # Set motor directions: Motor1 direction follows the sign of angle_diff, Motor2 is inverted
+    if direction == 1:
+        GPIO.output(MOTOR1_DIR_PIN, GPIO.HIGH)  # Motor1 CW (for example)
+        GPIO.output(MOTOR2_DIR_PIN, GPIO.LOW)   # Motor2 CCW, so both gears rotate same way
+    else:
+        GPIO.output(MOTOR1_DIR_PIN, GPIO.LOW)   # Motor1 CCW
+        GPIO.output(MOTOR2_DIR_PIN, GPIO.HIGH)  # Motor2 CW (inverted)
+
+    # --- Motion profile calculation (trapezoidal speed profile) ---
+    # Determine how many steps to accelerate and decelerate
+    if ACCELERATION_STEPS > 0:
+        # Steps needed to accelerate from 0 to max speed (using v^2 = 2*a*x formula)
+        accel_steps_needed = (MAX_SPEED_STEPS ** 2) / (2 * ACCELERATION_STEPS)
+    else:
+        accel_steps_needed = steps_to_move  # if no acceleration (should not be zero to avoid division)
+    accel_steps = int(accel_steps_needed)
+    decel_steps = int(accel_steps_needed)
+
+    # If the total steps is too short to reach max speed, use triangular profile
+    if accel_steps + decel_steps > steps_to_move:
+        accel_steps = steps_to_move // 2
+        decel_steps = steps_to_move - accel_steps
+        cruise_steps = 0
+        # Calculate effective peak speed we will reach (approximate)
+        if accel_steps > 0:
+            max_speed_reached = math.sqrt(2 * ACCELERATION_STEPS * accel_steps)
+        else:
+            max_speed_reached = 0
+    else:
+        # There will be a constant-speed cruise phase
+        cruise_steps = steps_to_move - accel_steps - decel_steps
+        max_speed_reached = MAX_SPEED_STEPS
+
+    # Safety cap: don't exceed desired MAX_SPEED_STEPS
+    if max_speed_reached > MAX_SPEED_STEPS:
+        max_speed_reached = MAX_SPEED_STEPS
+
+    # --- Generate steps with acceleration ---
+    # Minimum pulse width for step signal (to ensure driver registers the pulse)
+    pulse_width = 0.000005  # 5 microseconds high on step pin (adjust if needed by driver spec)
+
+    # Acceleration phase
+    for i in range(1, accel_steps + 1):
+        # linearly ramp up speed from 0 to max_speed_reached
+        speed_fraction = i / accel_steps  # fraction of accel phase completed (0 to 1)
+        step_speed = max_speed_reached * speed_fraction  # current step speed in steps/sec
+        if step_speed < 1e-6:
+            step_delay = 0.01  # very slow start (if only a few steps, ensure a reasonable delay)
+        else:
+            step_delay = 1.0 / step_speed  # interval between steps in seconds
+        # Step both motors once
+        GPIO.output(MOTOR1_STEP_PIN, GPIO.HIGH)
+        GPIO.output(MOTOR2_STEP_PIN, GPIO.HIGH)
+        time.sleep(pulse_width)                # keep step HIGH for a short pulse
+        GPIO.output(MOTOR1_STEP_PIN, GPIO.LOW)
+        GPIO.output(MOTOR2_STEP_PIN, GPIO.LOW)
+        # Wait for the remainder of the step interval (subtract pulse_width so total period = step_delay)
+        if step_delay > pulse_width:
+            time.sleep(step_delay - pulse_width)
+        else:
+            time.sleep(step_delay)
+
+    # Constant-speed cruise phase (if any)
+    if cruise_steps > 0:
+        step_delay = 1.0 / max_speed_reached  # constant fast speed
+        for i in range(cruise_steps):
+            GPIO.output(MOTOR1_STEP_PIN, GPIO.HIGH)
+            GPIO.output(MOTOR2_STEP_PIN, GPIO.HIGH)
+            time.sleep(pulse_width)
+            GPIO.output(MOTOR1_STEP_PIN, GPIO.LOW)
+            GPIO.output(MOTOR2_STEP_PIN, GPIO.LOW)
+            if step_delay > pulse_width:
+                time.sleep(step_delay - pulse_width)
+            else:
+                time.sleep(step_delay)
+
+    # Deceleration phase
+    for j in range(decel_steps, 0, -1):
+        # linearly ramp down speed from max_speed_reached to 0
+        speed_fraction = j / decel_steps  # fraction of decel phase remaining (1 to 0)
+        step_speed = max_speed_reached * speed_fraction  # current step speed in steps/sec
+        if step_speed < 1e-6:
+            step_delay = 0.01  # avoid extremely small values
+        else:
+            step_delay = 1.0 / step_speed
+        GPIO.output(MOTOR1_STEP_PIN, GPIO.HIGH)
+        GPIO.output(MOTOR2_STEP_PIN, GPIO.HIGH)
+        time.sleep(pulse_width)
+        GPIO.output(MOTOR1_STEP_PIN, GPIO.LOW)
+        GPIO.output(MOTOR2_STEP_PIN, GPIO.LOW)
+        if step_delay > pulse_width:
+            time.sleep(step_delay - pulse_width)
+        else:
+            time.sleep(step_delay)
+
+    # Update current angle to the new target
+    current_angle = target_angle
+
+# --- Example usage: move motors to various angles for testing ---
+try:
+    # Move to +15 degrees
+    move_to_angle(15.0)
+    time.sleep(1)  # hold for a second
+    # Move to -15 degrees (opposite direction)
+    move_to_angle(-15.0)
+    time.sleep(1)  # hold
+    # Return to 0 degrees (home position)
+    move_to_angle(0.0)
+    time.sleep(1)
+finally:
+    # Clean up GPIO pins on exit (if you prefer motors to remain energized, you can omit this)
+    GPIO.cleanup()
