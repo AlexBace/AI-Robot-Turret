@@ -1,0 +1,5 @@
+This project is a beginner-friendly, open-source two-axis robotic turret controlled by a Raspberry Pi. It is designed to rotate in two axes (pan and tilt) using two powerful NEMA 23 closed-loop stepper motors and their drivers. 
+Closed-loop stepper motors include encoders for feedback, allowing more precise and reliable positioning with no missed steps
+docs.cirkitdesigner.com. The goal of the project is to provide a clear example of how to build and program a dual-axis turret platform – 
+for example, to aim a camera, sensor, or small launcher – while learning about stepper motor control, GPIO interfacing, and basic robotics. 
+The repository includes all the necessary code, hardware information, and instructions to get started.
