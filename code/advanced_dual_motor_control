@@ -1,0 +1,245 @@
+# dual_turret_control.py
+# Two stepper motors on a Raspberry Pi with coordinated, shaped acceleration + CLI.
+#
+# WIRING (common-anode with opto-isolated drivers):
+#   - Tie PUL+, DIR+, ENA+ on each driver to Pi 3.3V (Pin 1).
+#   - Tie PUL- / DIR- / ENA- to the GPIO pins below.
+#   - Share GND between Pi and driver (Pi Pin 6 to driver GND / PSU V-).
+#   - Motor1: DIR=GPIO20, STEP=GPIO21, ENA=GPIO22
+#   - Motor2: DIR=GPIO19, STEP=GPIO26, ENA=GPIO23
+#
+# NOTES:
+#   - ENA inputs are active-low on most drivers. In this wiring, driving GPIO HIGH = enabled.
+#   - Use sudo to run (GPIO access): sudo python3 dual_turret_control.py --gears 15
+#   - Angles are *motor shaft degrees* (side gears), not the center gear / end-effector.
+
+import RPi.GPIO as GPIO
+import time, math
+
+# ---------------- Pin map (BCM) ----------------
+M1_DIR, M1_STEP, M1_ENA = 20, 21, 22
+M2_DIR, M2_STEP, M2_ENA = 19, 26, 23
+
+# ---------------- Motor & motion params (defaults; can be overridden by CLI) ----------------
+STEPS_PER_REV   = 200        # 200 for a 1.8° stepper
+MICROSTEPPING   = 16         # match your driver DIP
+GEAR_RATIO      = 3.0        # motor rev : output rev (FYI; not used for side-gear tests)
+
+# Speed/accel in **motor shaft degrees**
+MAX_SPEED_DEG     = 180.0    # deg/s
+ACCELERATION_DEG  = 720.0    # deg/s^2
+ACCEL_SHAPE       = 0.55     # <1.0 = snappier early ramp; 1.0 = linear; >1.0 = softer
+
+# Pulse timing
+PULSE_HIGH_S      = 8e-6     # step pulse HIGH time (8 µs)
+MIN_STEP_DELAY_S  = 100e-6   # floor so sleep() stays sane
+
+# Motor orientation
+MOTOR2_INVERT_DIR = True     # True = Motor2 spins opposite logical direction (opposite mounting)
+
+# Hold behavior on exit
+DISABLE_ON_EXIT   = False    # set True to de-energize drivers when program exits
+
+# ---------------- Derived (computed below; re-computed if CLI changes speed/accel/microsteps) ----------------
+STEPS_PER_REV_EFF = None
+STEPS_PER_DEG     = None
+MAX_SPEED_STEPS   = None
+ACCELERATION_STEPS= None
+
+def _recompute_units():
+    global STEPS_PER_REV_EFF, STEPS_PER_DEG, MAX_SPEED_STEPS, ACCELERATION_STEPS
+    STEPS_PER_REV_EFF = STEPS_PER_REV * MICROSTEPPING
+    STEPS_PER_DEG     = STEPS_PER_REV_EFF / 360.0
+    MAX_SPEED_STEPS   = MAX_SPEED_DEG    * STEPS_PER_DEG
+    ACCELERATION_STEPS= ACCELERATION_DEG * STEPS_PER_DEG
+
+_recompute_units()
+
+# ---------------- GPIO setup ----------------
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+for pin in (M1_DIR, M1_STEP, M2_DIR, M2_STEP, M1_ENA, M2_ENA):
+    GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+
+# Enable drivers (active-low input, so HIGH = enabled in our wiring)
+GPIO.output(M1_ENA, GPIO.HIGH)
+GPIO.output(M2_ENA, GPIO.HIGH)
+
+# Track absolute positions in motor shaft degrees
+m1_angle_deg = 0.0
+m2_angle_deg = 0.0
+
+# ---------------- Low-level helpers ----------------
+def _set_dir(pin, positive: bool):
+    GPIO.output(pin, GPIO.HIGH if positive else GPIO.LOW)
+
+def _ramp_speed_profile(total_ticks, accel_ticks, cruise_ticks, decel_ticks, max_steps_per_s):
+    """
+    Yield step period (s) per coordinated 'tick' using a shaped trapezoid.
+    ACCEL_SHAPE shapes accel/decel: 0.5 ~ aggressive, 1.0 linear, >1.0 softer.
+    """
+    accel_ticks = max(1, accel_ticks)
+    decel_ticks = max(1, decel_ticks)
+
+    for k in range(1, total_ticks + 1):
+        if k <= accel_ticks:
+            frac = (k / accel_ticks) ** ACCEL_SHAPE
+            spd  = max_steps_per_s * frac
+        elif k <= accel_ticks + cruise_ticks:
+            spd  = max_steps_per_s
+        else:
+            rem  = total_ticks - k + 1
+            frac = (rem / decel_ticks) ** ACCEL_SHAPE
+            spd  = max_steps_per_s * frac
+
+        # Convert speed (steps/s) to period (s); cap to avoid zero/inf
+        period = 1.0 / max(spd, 1.0 / MIN_STEP_DELAY_S)
+        yield max(period, MIN_STEP_DELAY_S)
+
+def _coordinated_move(m1_steps_target, m2_steps_target, m1_dir_pos: bool, m2_dir_pos: bool):
+    """
+    DDA-style coordinated stepping so both motors finish together.
+    N = max(steps1, steps2). Each tick may step M1, M2, or both.
+    """
+    _set_dir(M1_DIR, m1_dir_pos)
+    _set_dir(M2_DIR, m2_dir_pos)
+
+    n1 = int(abs(m1_steps_target))
+    n2 = int(abs(m2_steps_target))
+    N  = max(n1, n2)
+    if N == 0:
+        return
+
+    # Trapezoid in 'ticks' (fast motor steps each tick)
+    if ACCELERATION_STEPS > 0 and MAX_SPEED_STEPS > 0:
+        accel_ticks = int((MAX_SPEED_STEPS ** 2) / (2 * ACCELERATION_STEPS))
+    else:
+        accel_ticks = 0
+    accel_ticks  = max(1, min(accel_ticks, N // 2))
+    decel_ticks  = accel_ticks
+    cruise_ticks = max(0, N - accel_ticks - decel_ticks)
+
+    # Bresenham accumulators
+    acc1 = 0
+    acc2 = 0
+
+    for period in _ramp_speed_profile(N, accel_ticks, cruise_ticks, decel_ticks, MAX_SPEED_STEPS):
+        step1 = step2 = False
+
+        acc1 += n1
+        if acc1 >= N:
+            acc1 -= N
+            step1 = True
+
+        acc2 += n2
+        if acc2 >= N:
+            acc2 -= N
+            step2 = True
+
+        if step1: GPIO.output(M1_STEP, GPIO.HIGH)
+        if step2: GPIO.output(M2_STEP, GPIO.HIGH)
+
+        time.sleep(PULSE_HIGH_S)
+
+        if step1: GPIO.output(M1_STEP, GPIO.LOW)
+        if step2: GPIO.output(M2_STEP, GPIO.LOW)
+
+        rem = period - PULSE_HIGH_S
+        if rem > 0:
+            time.sleep(rem)
+
+# ---------------- Public movement APIs ----------------
+def move_to_angles(target_deg_m1: float, target_deg_m2: float):
+    """
+    Absolute positioning (motor shaft degrees) for each motor, coordinated.
+    """
+    global m1_angle_deg, m2_angle_deg
+
+    d1 = target_deg_m1 - m1_angle_deg
+    d2 = target_deg_m2 - m2_angle_deg
+
+    s1 = int(round(abs(d1) * STEPS_PER_DEG))
+    s2 = int(round(abs(d2) * STEPS_PER_DEG))
+
+    dir1_pos = (d1 >= 0)
+    dir2_pos = (d2 >= 0)
+    if MOTOR2_INVERT_DIR:
+        dir2_pos = not dir2_pos
+
+    _coordinated_move(s1, s2, dir1_pos, dir2_pos)
+
+    m1_angle_deg = target_deg_m1
+    m2_angle_deg = target_deg_m2
+
+def move_gears_to(angle_deg: float):
+    """
+    Convenience: move both side gears to the SAME absolute gear angle.
+    (Motor2 direction auto-inverted by MOTOR2_INVERT_DIR.)
+    """
+    move_to_angles(angle_deg, angle_deg)
+
+# ---------------- CLI ----------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Two-motor turret control (side gears) with shaped acceleration."
+    )
+    # Targets
+    parser.add_argument("--m1", type=float, help="Target angle for Motor 1 (deg)")
+    parser.add_argument("--m2", type=float, help="Target angle for Motor 2 (deg)")
+    parser.add_argument("--gears", type=float, help="Target angle for BOTH gears (deg)")
+
+    # Tuning
+    parser.add_argument("--speed", type=float, help="Max speed (deg/s)")
+    parser.add_argument("--accel", type=float, help="Acceleration (deg/s^2)")
+    parser.add_argument("--shape", type=float, help="Accel shape (<1=snappy, 1=linear, >1=softer)")
+
+    # Hardware params (optional)
+    parser.add_argument("--spr", type=int, help="Steps per rev (default 200)")
+    parser.add_argument("--micro", type=int, help="Microstepping (default 16)")
+    parser.add_argument("--invert2", dest="invert2", action="store_true",
+                        help="Invert Motor2 logical direction (default True)")
+    parser.add_argument("--no-invert2", dest="invert2", action="store_false",
+                        help="Do NOT invert Motor2 logical direction")
+    parser.set_defaults(invert2=MOTOR2_INVERT_DIR)
+
+    # Exit behavior
+    parser.add_argument("--disable-on-exit", action="store_true",
+                        help="Disable drivers (ENA low) when program exits")
+
+    args = parser.parse_args()
+
+    # Apply CLI overrides
+    if args.spr is not None:
+        STEPS_PER_REV = args.spr
+    if args.micro is not None:
+        MICROSTEPPING = args.micro
+    if args.speed is not None:
+        MAX_SPEED_DEG = args.speed
+    if args.accel is not None:
+        ACCELERATION_DEG = args.accel
+    if args.shape is not None:
+        ACCEL_SHAPE = args.shape
+    MOTOR2_INVERT_DIR = args.invert2
+    DISABLE_ON_EXIT   = args.disable_on_exit
+
+    _recompute_units()
+
+    try:
+        if args.gears is not None:
+            move_gears_to(args.gears)
+        elif (args.m1 is not None) or (args.m2 is not None):
+            target_m1 = args.m1 if args.m1 is not None else m1_angle_deg
+            target_m2 = args.m2 if args.m2 is not None else m2_angle_deg
+            move_to_angles(target_m1, target_m2)
+        else:
+            # Demo if no arguments
+            move_gears_to(20.0); time.sleep(0.4)
+            move_to_angles(30.0, -30.0); time.sleep(0.4)
+            move_gears_to(0.0)
+    finally:
+        if DISABLE_ON_EXIT:
+            GPIO.output(M1_ENA, GPIO.LOW)
+            GPIO.output(M2_ENA, GPIO.LOW)
+        # If you want to fully release GPIO state, uncomment:
+        # GPIO.cleanup()
