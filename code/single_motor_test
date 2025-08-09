@@ -1,0 +1,51 @@
+import RPi.GPIO as GPIO
+import time
+
+# GPIO pin assignments (BCM numbering)
+STEP_PIN = 17    # connected to PUL- on driver
+DIR_PIN  = 27    # connected to DIR- on driver
+ENA_PIN  = 22    # connected to ENA- on driver
+
+# Setup GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(STEP_PIN, GPIO.OUT)
+GPIO.setup(DIR_PIN, GPIO.OUT)
+GPIO.setup(ENA_PIN, GPIO.OUT)
+
+# Enable the driver (ENA is active-low: set HIGH to enable)
+GPIO.output(ENA_PIN, GPIO.HIGH)
+
+# Example: move motor 1 revolution clockwise, then 1 revolution counterclockwise
+# Adjust steps_per_rev according to microstep setting of your driver:
+steps_per_rev = 2000  # example value; if unsure, try a large number like 2000 or 4000
+
+# Choose a pulse delay to set speed (in seconds)
+# Smaller delay -> faster rotation. Start with something like 0.001 (1ms high, 1ms low -> 500 Hz)
+pulse_delay = 0.001  # 1 ms half-period -> 500 pulses/sec (if 2000 steps/rev, that's 0.25 rev/sec)
+
+try:
+    # Set direction to clockwise (you can use GPIO.HIGH/LOW depending on what clockwise means in your wiring)
+    GPIO.output(DIR_PIN, GPIO.HIGH)
+    # Send pulses for one full revolution
+    for i in range(steps_per_rev):
+        GPIO.output(STEP_PIN, GPIO.HIGH)
+        time.sleep(pulse_delay)       # keep the pulse high for a short time
+        GPIO.output(STEP_PIN, GPIO.LOW)
+        time.sleep(pulse_delay)       # low for the same pulse width
+
+    time.sleep(1.0)  # 1 second pause
+
+    # Now rotate one revolution in the opposite direction
+    GPIO.output(DIR_PIN, GPIO.LOW)    # change direction
+    for i in range(steps_per_rev):
+        GPIO.output(STEP_PIN, GPIO.HIGH)
+        time.sleep(pulse_delay)
+        GPIO.output(STEP_PIN, GPIO.LOW)
+        time.sleep(pulse_delay)
+
+    time.sleep(1.0)  # pause
+finally:
+    # Optionally, disable the motor (de-energize) after movement
+    GPIO.output(ENA_PIN, GPIO.LOW)  # pull ENA low to disable, if you want to release motor
+    # Clean up GPIO settings
+    GPIO.cleanup()
