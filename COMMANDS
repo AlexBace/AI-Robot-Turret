@@ -1,0 +1,75 @@
+REPL Commands (type after starting --repl)
+Angles are motor-shaft degrees. Moves block until finished.
+
+help
+Show this help list.
+
+status
+Print current angles and tuning:
+
+both <deg>
+Move both motors to the same absolute angle.
+Example: both 15
+
+m1 <deg>
+Move Motor 1 to an absolute angle (Motor 2 stays).
+Example: m1 30
+
+m2 <deg>
+Move Motor 2 to an absolute angle (Motor 1 stays).
+Example: m2 -10
+
+jog m1 <±deg> / jog m2 <±deg>
+Relative nudges.
+Examples: jog m1 +5, jog m2 -3
+
+speed <deg/s>
+Set max speed. Example: speed 240
+
+accel <deg/s^2>
+Set acceleration. Example: accel 1500
+
+shape <num>
+Accel curve shape:
+
+< 1.0 = snappier early acceleration
+
+1.0 = linear
+
+> 1.0 = softer start
+Example: shape 0.5
+
+quit (or exit, q)
+Exit the REPL.
+
+Tip: Use REPL for sequences because angles persist while the REPL runs.
+
+CLI Flags (one-shot)
+All angles are absolute (session-absolute; start at 0°/0° each run).
+
+--gears <deg>
+Move both motors to the same absolute angle.
+
+--m1 <deg> / --m2 <deg>
+Set each motor’s absolute angle. If you provide only one, the other holds its current value.
+
+--speed <deg/s>
+Max speed (motor-shaft deg/s).
+
+--accel <deg/s^2>
+Acceleration.
+
+--shape <num>
+Accel curve shape (snappier ↔ softer).
+
+--spr <steps>
+Steps per revolution (default 200 for a 1.8° stepper).
+
+--micro <steps>
+Microstepping (e.g., 16) — match your driver DIP.
+
+--invert2 / --no-invert2
+Invert Motor 2’s logical direction (default is inverted).
+
+--disable-on-exit
+Drop ENA on exit (de-energize). By default motors stay enabled to hold position.
