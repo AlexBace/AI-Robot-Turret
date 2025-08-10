@@ -21,7 +21,7 @@ PSU V+ → each driver V+ / DC+
 PSU V‑ → each driver V‑ / GND
 Pi GND must be common with driver logic ground
 
-**Never connect 24 V to the Pi. Power the Pi via its normal 5 V USB‑C adapter.**
+Never connect 24 V to the Pi. Power the Pi via its normal 5 V USB‑C adapter.
 
 Control Signal Wiring (common‑anode with opto‑isolated drivers)
 Tie each driver’s PUL+ / DIR+ / ENA+ to Pi 3.3 V.
@@ -55,16 +55,24 @@ sudo python3 code/dual_turret_control.py --help
 - Because this is a differential: the end effector’s orientation is determined by combinations of the two motor angles. We’ll add the mapping (inverse kinematics) later.
 - Right now: use this to verify wiring, tune ramps, and characterize behavior under load.
 
-**Running the Code (CLI)**
+**Running the Code (CLI)** (look for more info on the commands file)
 From the repo root:
 
-# Symmetric test: both motors to +15° (Motor 2 auto-inverted so side gears “spin the same way”)
+cd ~/Documents
+sudo python3 turret_repl.py --gears 15
+sudo python3 turret_repl.py --m1 30 --m2 -10 --speed 240 --accel 1500 --shape 0.5
+
+**Run (REPL – recommended for testing)** (look for more info on the commands file)
+cd ~/Documents
+sudo python3 turret_repl.py --repl
+
+Symmetric test: both motors to +15° (Motor 2 auto-inverted so side gears “spin the same way”)
 sudo python3 code/dual_turret_control.py --gears 15
 
-# Independent targets: M1 = +30°, M2 = -10°
+Independent targets: M1 = +30°, M2 = -10°
 sudo python3 code/dual_turret_control.py --m1 30 --m2 -10
 
-# Make it faster and snappier (steeper ramp)
+Make it faster and snappier (steeper ramp)
 sudo python3 code/dual_turret_control.py --m1 30 --m2 -10 --speed 240 --accel 1500 --shape 0.5
 
 **CLI Options**
